@@ -6,30 +6,38 @@ import { tradesTable, botSettingsTable } from "@workspace/db";
 const router: IRouter = Router();
 
 router.get("/bot/status", async (req, res) => {
-  try {
-    const botState = getBotState();
+  const botState = getBotState();
 
+  let openPositions = 0;
+  let activeMarkets = 5;
+  let dbReady = true;
+  let dbError: string | null = null;
+
+  try {
     const openTrades = await db.select().from(tradesTable);
-    const openPositions = openTrades.filter((t) => !t.exitDate).length;
+    openPositions = openTrades.filter((t) => !t.exitDate).length;
 
     const settings = await db.select().from(botSettingsTable).limit(1);
-    const activeMarkets = settings[0]
+    activeMarkets = settings[0]
       ? settings[0].enabledMarkets.split(",").filter(Boolean).length
       : 5;
-
-    res.json({
-      running:        botState.running,
-      uptime:         botState.uptime,
-      lastScan:       botState.lastScan,
-      openPositions,
-      activeMarkets,
-      sessionValid:   botState.sessionValid,
-      error:          botState.error,
-    });
   } catch (err) {
-    req.log.error({ err }, "Failed to get bot status");
-    res.status(500).json({ error: "Failed to get bot status" });
+    dbReady = false;
+    dbError = err instanceof Error ? err.message : String(err);
+    req.log.warn({ err: dbError }, "DB not ready — bot/status degraded response");
   }
+
+  res.json({
+    running:      botState.running,
+    uptime:       botState.uptime,
+    lastScan:     botState.lastScan,
+    openPositions,
+    activeMarkets,
+    sessionValid: botState.sessionValid,
+    error:        botState.error,
+    dbReady,
+    dbError,
+  });
 });
 
 router.post("/bot/start", async (req, res) => {
