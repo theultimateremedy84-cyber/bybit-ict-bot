@@ -1,0 +1,188 @@
+/**
+ * ensureDb — create tables if they do not already exist.
+ *
+ * This runs INSIDE the Express process (called from index.ts before
+ * app.listen) so the schema is always initialised regardless of what
+ * happened to scripts/init-db.mjs at container start time.
+ *
+ * Uses the raw pg.Pool (same connection string / SSL settings as Drizzle)
+ * so it works on Railway, Heroku, Supabase, Render, and local Postgres
+ * without any extra configuration.
+ */
+
+import { Pool } from "pg";
+import { logger } from "./logger";
+
+function getSsl(): false | { rejectUnauthorized: false } {
+  const url = process.env["DATABASE_URL"] ?? "";
+  if (!url) return false;
+  if (url.includes("localhost") || url.includes("127.0.0.1")) return false;
+  return { rejectUnauthorized: false };
+}
+
+export async function ensureDb(): Promise<void> {
+  const url = process.env["DATABASE_URL"];
+  if (!url) {
+    logger.warn("DATABASE_URL is not set — skipping DB schema initialisation");
+    return;
+  }
+
+  const ssl = getSsl();
+  const pool = new Pool({
+    connectionString: url,
+    ...(ssl ? { ssl } : {}),
+  });
+
+  try {
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS bot_settings (
+        id                   SERIAL  PRIMARY KEY,
+        trade_amount_usdt    REAL    NOT NULL DEFAULT 7000,
+        risk_per_trade       REAL    NOT NULL DEFAULT 1.0,
+        max_open_trades      INTEGER NOT NULL DEFAULT 5,
+        daily_loss_limit     REAL    NOT NULL DEFAULT 3.0,
+        enabled_markets      TEXT    NOT NULL DEFAULT 'BTCUSDT,ETHUSDT,SOLUSDT,BNBUSDT,XRPUSDT',
+        enabled_kill_zones   TEXT    NOT NULL DEFAULT 'LONDON,NEW_YORK,ASIAN',
+        min_confidence       REAL    NOT NULL DEFAULT 55.0,
+        use_order_blocks     BOOLEAN NOT NULL DEFAULT TRUE,
+        use_fair_value_gaps  BOOLEAN NOT NULL DEFAULT TRUE,
+        use_liquidity_sweeps BOOLEAN NOT NULL DEFAULT TRUE,
+        use_bos              BOOLEAN NOT NULL DEFAULT TRUE,
+        use_cho_ch           BOOLEAN NOT NULL DEFAULT TRUE,
+        trailing_stop        BOOLEAN NOT NULL DEFAULT FALSE,
+        min_rr               REAL    NOT NULL DEFAULT 2.0,
+        bybit_api_key        TEXT    NOT NULL DEFAULT '',
+        bybit_api_secret     TEXT    NOT NULL DEFAULT '',
+        bybit_testnet        BOOLEAN NOT NULL DEFAULT TRUE,
+        bybit_demo           BOOLEAN NOT NULL DEFAULT FALSE,
+        stop_loss_mode       TEXT    NOT NULL DEFAULT 'PERCENT',
+        stop_loss_value      REAL    NOT NULL DEFAULT 50,
+        take_profit_mode     TEXT    NOT NULL DEFAULT 'PERCENT',
+        take_profit_value    REAL    NOT NULL DEFAULT 10,
+        updated_at           TIMESTAMP NOT NULL DEFAULT NOW()
+      );
+    `);
+    // Migrate existing tables: every column added after the first deploy must be
+    // backfilled here, because CREATE TABLE IF NOT EXISTS is a no-op on an
+    // existing table and Drizzle would then SELECT columns that don't exist.
+    await pool.query(`
+       ALTER TABLE bot_settings ADD COLUMN IF NOT EXISTS trade_amount_usdt REAL NOT NULL DEFAULT 7000;
+       ALTER TABLE bot_settings ALTER COLUMN trade_amount_usdt SET DEFAULT 7000;
+       UPDATE bot_settings SET trade_amount_usdt = 7000 WHERE trade_amount_usdt <= 0;
+       ALTER TABLE bot_settings ALTER COLUMN max_open_trades SET DEFAULT 5;
+       UPDATE bot_settings SET max_open_trades = 5 WHERE max_open_trades = 3;
+      ALTER TABLE bot_settings ADD COLUMN IF NOT EXISTS use_order_flow BOOLEAN NOT NULL DEFAULT TRUE;
+      ALTER TABLE bot_settings ADD COLUMN IF NOT EXISTS order_flow_veto_threshold REAL NOT NULL DEFAULT 25;
+      ALTER TABLE bot_settings ADD COLUMN IF NOT EXISTS require_flow_confirmation BOOLEAN NOT NULL DEFAULT TRUE;
+      ALTER TABLE bot_settings ADD COLUMN IF NOT EXISTS min_flow_confirmation REAL NOT NULL DEFAULT 12;
+      ALTER TABLE bot_settings ADD COLUMN IF NOT EXISTS crypto_mode BOOLEAN NOT NULL DEFAULT TRUE;
+      ALTER TABLE bot_settings ADD COLUMN IF NOT EXISTS max_relative_spread REAL NOT NULL DEFAULT 0.0008;
+        ALTER TABLE bot_settings ADD COLUMN IF NOT EXISTS max_leverage REAL NOT NULL DEFAULT 50;
+       ALTER TABLE bot_settings ALTER COLUMN max_leverage SET DEFAULT 50;
+        UPDATE bot_settings SET max_leverage = 50;
+      ALTER TABLE bot_settings ADD COLUMN IF NOT EXISTS scale_by_confidence BOOLEAN NOT NULL DEFAULT TRUE;
+       ALTER TABLE bot_settings ADD COLUMN IF NOT EXISTS max_per_correlation_group INTEGER NOT NULL DEFAULT 5;
+       ALTER TABLE bot_settings ALTER COLUMN max_per_correlation_group SET DEFAULT 5;
+       UPDATE bot_settings SET max_per_correlation_group = 5 WHERE max_per_correlation_group = 2;
+      ALTER TABLE bot_settings ADD COLUMN IF NOT EXISTS max_directional_leverage REAL NOT NULL DEFAULT 3;
+      ALTER TABLE bot_settings ADD COLUMN IF NOT EXISTS max_total_leverage REAL NOT NULL DEFAULT 5;
+      ALTER TABLE bot_settings ADD COLUMN IF NOT EXISTS break_even_at_r REAL NOT NULL DEFAULT 1.0;
+      ALTER TABLE bot_settings ADD COLUMN IF NOT EXISTS trail_at_r REAL NOT NULL DEFAULT 1.5;
+      ALTER TABLE bot_settings ADD COLUMN IF NOT EXISTS trail_atr_multiple REAL NOT NULL DEFAULT 1.5;
+      ALTER TABLE bot_settings ADD COLUMN IF NOT EXISTS bybit_demo BOOLEAN NOT NULL DEFAULT FALSE;
+      ALTER TABLE bot_settings ADD COLUMN IF NOT EXISTS reverse_signals BOOLEAN NOT NULL DEFAULT FALSE;
+      ALTER TABLE bot_settings ADD COLUMN IF NOT EXISTS bot_enabled BOOLEAN NOT NULL DEFAULT FALSE;
+        ALTER TABLE bot_settings ADD COLUMN IF NOT EXISTS stop_loss_mode TEXT NOT NULL DEFAULT 'PERCENT';
+        ALTER TABLE bot_settings ADD COLUMN IF NOT EXISTS stop_loss_value REAL NOT NULL DEFAULT 50;
+        ALTER TABLE bot_settings ADD COLUMN IF NOT EXISTS take_profit_mode TEXT NOT NULL DEFAULT 'PERCENT';
+        ALTER TABLE bot_settings ADD COLUMN IF NOT EXISTS take_profit_value REAL NOT NULL DEFAULT 10;
+        ALTER TABLE bot_settings ALTER COLUMN stop_loss_mode SET DEFAULT 'PERCENT';
+        ALTER TABLE bot_settings ALTER COLUMN stop_loss_value SET DEFAULT 50;
+        ALTER TABLE bot_settings ALTER COLUMN take_profit_mode SET DEFAULT 'PERCENT';
+        ALTER TABLE bot_settings ALTER COLUMN take_profit_value SET DEFAULT 10;
+        UPDATE bot_settings
+           SET stop_loss_mode = 'PERCENT', stop_loss_value = 50
+         WHERE stop_loss_mode = 'STRATEGY' AND stop_loss_value <= 0;
+        UPDATE bot_settings
+           SET take_profit_mode = 'PERCENT', take_profit_value = 10
+         WHERE take_profit_mode = 'STRATEGY' AND take_profit_value <= 0;
+        -- One-time forced reset to the margin-based exit defaults:
+        -- take profit = 10% of the committed margin (700 USDT on 7,000)
+        -- stop loss   = 50% of the committed margin (3,500 USDT on 7,000)
+        -- Runs once per database; later manual edits in Settings are kept.
+        ALTER TABLE bot_settings
+          ADD COLUMN IF NOT EXISTS margin_exit_defaults_version INTEGER NOT NULL DEFAULT 0;
+        UPDATE bot_settings
+           SET stop_loss_mode   = 'PERCENT',
+               stop_loss_value  = 50,
+               take_profit_mode = 'PERCENT',
+               take_profit_value = 10,
+               margin_exit_defaults_version = 1
+         WHERE margin_exit_defaults_version < 1;
+    `);
+
+    logger.info("DB schema: bot_settings ready");
+
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS signals (
+        id                SERIAL    PRIMARY KEY,
+        epic              TEXT      NOT NULL,
+        market            TEXT      NOT NULL,
+        direction         TEXT      NOT NULL,
+        signal_type       TEXT      NOT NULL,
+        timeframe         TEXT      NOT NULL,
+        entry_price       REAL      NOT NULL,
+        stop_loss         REAL      NOT NULL,
+        take_profit       REAL      NOT NULL,
+        confidence        REAL      NOT NULL,
+        detected_at       TIMESTAMP NOT NULL DEFAULT NOW(),
+        executed          BOOLEAN   NOT NULL DEFAULT FALSE,
+        kill_zone         TEXT,
+        notes             TEXT,
+        htf_bias          TEXT,
+        structure_context TEXT
+      );
+    `);
+    await pool.query(`
+      ALTER TABLE signals ADD COLUMN IF NOT EXISTS order_flow_score REAL;
+      ALTER TABLE signals ADD COLUMN IF NOT EXISTS order_flow_bias TEXT;
+      ALTER TABLE signals ADD COLUMN IF NOT EXISTS order_flow_notes TEXT;
+    `);
+    logger.info("DB schema: signals ready");
+
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS trades (
+        id                SERIAL    PRIMARY KEY,
+        deal_id           TEXT,
+        epic              TEXT      NOT NULL,
+        market            TEXT      NOT NULL,
+        direction         TEXT      NOT NULL,
+        size              REAL      NOT NULL,
+        entry_price       REAL      NOT NULL,
+        exit_price        REAL,
+        profit            REAL,
+        entry_date        TIMESTAMP NOT NULL DEFAULT NOW(),
+        exit_date         TIMESTAMP,
+        stop_loss         REAL      NOT NULL,
+        take_profit       REAL      NOT NULL,
+        strategy          TEXT      NOT NULL DEFAULT 'ICT',
+        result            TEXT,
+        risk_reward_ratio REAL,
+        signal_id         INTEGER,
+        notes             TEXT
+      );
+    `);
+    await pool.query(`
+      ALTER TABLE trades ADD COLUMN IF NOT EXISTS order_flow_score REAL;
+    `);
+    logger.info("DB schema: trades ready");
+
+    logger.info("Database schema initialised successfully");
+  } catch (err) {
+    // Log clearly but do NOT re-throw — a mis-configured DB shouldn't
+    // prevent the HTTP server from starting (the UI can still show errors).
+    logger.error({ err }, "ensureDb: failed to initialise schema — DB routes will return errors until fixed");
+  } finally {
+    await pool.end();
+  }
+}
